@@ -1189,12 +1189,25 @@
     let sourceCounts = { ...defaultSourceCounts };
     let historyStack = [];
     let redoStack = [];
-    let openingBookPromise = null;
-    const engineMoveCache = new Map();
     const squareRefs = {};
     const paletteButtons = {};
-    const humanBookLastMove = {};
-    const humanSources = new Set(["lichess-masters", "lichess-human"]);
+    const humanSources = new Set(["lichess-masters", "lichess-human", "opening-book"]);
+    const openingBookUrl = "./opening-book.json";
+    const stockfishAsmWorkerUrl = "./stockfish.js";
+    const stockfishWasmWorkerUrl = "./stockfish.wasm.js";
+    const engineMoveTimeMs = 1600;
+    const engineHashMb = 32;
+    const engineSearchDepth = 18;
+    const openingBookState = {
+      positions: null,
+      promise: null
+    };
+    const openingBookHistory = new Map();
+    const engineState = {
+      worker: null,
+      readyPromise: null,
+      pendingSearch: null
+    };
 
     const startPosition = {
       a8: "r", b8: "n", c8: "b", d8: "q", e8: "k", f8: "b", g8: "n", h8: "r",
@@ -1496,16 +1509,98 @@
       }
     }
 
-    function normalizeFenKey(fen) {
-      return String(fen || "").trim().split(/\s+/).slice(0, 4).join(" ");
-    }
-
     function createGame(fen) {
       try {
         return new Chess(fen);
       } catch (error) {
         return null;
       }
+    }
+
+    function deriveCastleStringFromBoard() {
+      let rights = "";
+
+      if (boardState.e1 === "K") {
+        if (boardState.h1 === "R") {
+          rights += "K";
+        }
+        if (boardState.a1 === "R") {
+          rights += "Q";
+        }
+      }
+
+      if (boardState.e8 === "k") {
+        if (boardState.h8 === "r") {
+          rights += "k";
+        }
+        if (boardState.a8 === "r") {
+          rights += "q";
+        }
+      }
+
+      return rights || "-";
+    }
+
+    function sanitizeEpSquare(turn, ep) {
+      const value = String(ep || "-").trim();
+      if (!/^[a-h][36]$/.test(value)) {
+        return "-";
+      }
+
+      const file = value[0];
+      const rank = value[1];
+      const fileIndex = files.indexOf(file);
+      if (fileIndex === -1) {
+        return "-";
+      }
+
+      if (turn === "w") {
+        if (rank !== "6" || boardState[file + "5"] !== "p") {
+          return "-";
+        }
+        const left = fileIndex > 0 ? files[fileIndex - 1] + "5" : "";
+        const right = fileIndex < files.length - 1 ? files[fileIndex + 1] + "5" : "";
+        if (boardState[left] !== "P" && boardState[right] !== "P") {
+          return "-";
+        }
+        return value;
+      }
+
+      if (rank !== "3" || boardState[file + "4"] !== "P") {
+        return "-";
+      }
+      const left = fileIndex > 0 ? files[fileIndex - 1] + "4" : "";
+      const right = fileIndex < files.length - 1 ? files[fileIndex + 1] + "4" : "";
+      if (boardState[left] !== "p" && boardState[right] !== "p") {
+        return "-";
+      }
+      return value;
+    }
+
+    function buildAnalyzableGameState() {
+      const rawFen = buildFen();
+      const rawGame = createGame(rawFen);
+      if (rawGame) {
+        return {
+          fen: rawFen,
+          game: rawGame
+        };
+      }
+
+      const sanitizedFen = [
+        buildPlacement(),
+        turnEl.value === "b" ? "b" : "w",
+        deriveCastleStringFromBoard(),
+        sanitizeEpSquare(turnEl.value, epEl.value),
+        Math.max(0, Number(halfmoveEl.value || 0)),
+        Math.max(1, Number(fullmoveEl.value || 1))
+      ].join(" ");
+      const sanitizedGame = createGame(sanitizedFen);
+
+      return {
+        fen: sanitizedGame ? sanitizedFen : rawFen,
+        game: sanitizedGame
+      };
     }
 
     function gameOverResult(game) {
@@ -1527,284 +1622,473 @@
       return { move: "game over", note: "" };
     }
 
-    function pieceValue(piece) {
-      const key = String(piece || "").toLowerCase();
-      if (key === "p") return 100;
-      if (key === "n") return 320;
-      if (key === "b") return 330;
-      if (key === "r") return 500;
-      if (key === "q") return 900;
-      if (key === "k") return 20000;
-      return 0;
+    function normalizeFenKey(fen) {
+      return String(fen || "")
+        .trim()
+        .split(/\s+/)
+        .slice(0, 4)
+        .join(" ");
     }
 
-    function materialBalance(game, perspective) {
-      let score = 0;
-      for (const row of game.board()) {
-        for (const piece of row) {
-          if (!piece) {
-            continue;
+    function randomChoice(list) {
+      return list[Math.floor(Math.random() * list.length)];
+    }
+
+    function normalizeUciMoveForGame(game, uci) {
+      const value = String(uci || "").trim().toLowerCase();
+      if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(value)) {
+        return "";
+      }
+
+      const move = {
+        from: value.slice(0, 2),
+        to: value.slice(2, 4),
+        promotion: value[4] || undefined
+      };
+
+      const piece = game.get(move.from);
+      if (!piece || piece.type !== "k") {
+        return value;
+      }
+
+      if (move.from === "e1" && move.to === "h1") {
+        return "e1g1";
+      }
+      if (move.from === "e1" && move.to === "a1") {
+        return "e1c1";
+      }
+      if (move.from === "e8" && move.to === "h8") {
+        return "e8g8";
+      }
+      if (move.from === "e8" && move.to === "a8") {
+        return "e8c8";
+      }
+
+      return value;
+    }
+
+    async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 2500) {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(url, {
+          ...options,
+          signal: controller.signal
+        });
+        const payload = await response.json().catch(() => null);
+        return { response, payload };
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    async function loadOpeningBook() {
+      if (openingBookState.positions) {
+        return openingBookState.positions;
+      }
+
+      if (!openingBookState.promise) {
+        openingBookState.promise = fetch(openingBookUrl, { cache: "no-store" })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error("opening book failed to load");
+            }
+            return response.json();
+          })
+          .then((payload) => {
+            const positions =
+              payload && typeof payload === "object" && payload.positions && typeof payload.positions === "object"
+                ? payload.positions
+                : {};
+            openingBookState.positions = positions;
+            return positions;
+          })
+          .catch((error) => {
+            openingBookState.promise = null;
+            throw error;
+          });
+      }
+
+      return openingBookState.promise;
+    }
+
+    async function requestOpeningBookMove(fen) {
+      let positions = null;
+
+      try {
+        positions = await loadOpeningBook();
+      } catch (error) {
+        return null;
+      }
+
+      const position = positions[normalizeFenKey(fen)];
+      const moves = Array.isArray(position?.moves)
+        ? position.moves.filter((move) => typeof move === "string" && /^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(move))
+        : [];
+
+      if (moves.length === 0) {
+        return null;
+      }
+
+      const lastMove = openingBookHistory.get(normalizeFenKey(fen));
+      const candidates = moves.length > 1 ? moves.filter((move) => move !== lastMove) : moves;
+      const uci = randomChoice(candidates.length > 0 ? candidates : moves);
+      openingBookHistory.set(normalizeFenKey(fen), uci);
+
+      return {
+        source: String(position?.source || "opening-book"),
+        uci
+      };
+    }
+
+    async function requestCloudEvalMove(fen) {
+      try {
+        const { response, payload } = await fetchJsonWithTimeout(
+          "https://lichess.org/api/cloud-eval?fen=" + encodeURIComponent(fen),
+          {
+            headers: { Accept: "application/json" },
+            cache: "no-store"
+          },
+          2200
+        );
+        if (!response.ok) {
+          return null;
+        }
+        const pvs = Array.isArray(payload?.pvs) ? payload.pvs : [];
+        const moves = typeof pvs[0]?.moves === "string" ? pvs[0].moves.trim().split(/\s+/) : [];
+        const uci = moves[0];
+        if (!uci || !/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
+          return null;
+        }
+        return {
+          source: "lichess-cloud-eval",
+          uci
+        };
+      } catch (error) {
+        return null;
+      }
+    }
+
+    async function requestChessApiMove(fen) {
+      try {
+        const { response, payload } = await fetchJsonWithTimeout(
+          "https://chess-api.com/v1",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json"
+            },
+            body: JSON.stringify({
+              fen,
+              depth: 15,
+              variants: 1
+            })
+          },
+          3200
+        );
+        if (!response.ok) {
+          return null;
+        }
+        const uci = String(payload?.move || "").trim();
+        if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
+          return null;
+        }
+        return {
+          source: "chess-api",
+          uci
+        };
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function wasmSupported() {
+      const source = Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00);
+      return (
+        typeof WebAssembly === "object" &&
+        typeof WebAssembly.validate === "function" &&
+        WebAssembly.validate(source)
+      );
+    }
+
+    function resetEngineWorker() {
+      if (engineState.pendingSearch) {
+        engineState.pendingSearch.reject(new Error("engine restarted"));
+        clearTimeout(engineState.pendingSearch.timer);
+        engineState.pendingSearch = null;
+      }
+
+      if (engineState.worker) {
+        engineState.worker.terminate();
+      }
+
+      engineState.worker = null;
+      engineState.readyPromise = null;
+    }
+
+    function createEngineWorker() {
+      return new Worker(wasmSupported() ? stockfishWasmWorkerUrl : stockfishAsmWorkerUrl);
+    }
+
+    function ensureEngineWorker() {
+      if (engineState.readyPromise) {
+        return engineState.readyPromise;
+      }
+
+      engineState.readyPromise = new Promise((resolve, reject) => {
+        const worker = createEngineWorker();
+        let phase = "uci";
+        const startupTimer = window.setTimeout(() => {
+          cleanup();
+          resetEngineWorker();
+          reject(new Error("engine startup timeout"));
+        }, 15000);
+
+        function cleanup() {
+          window.clearTimeout(startupTimer);
+          worker.removeEventListener("message", onMessage);
+          worker.removeEventListener("error", onError);
+        }
+
+        function onError() {
+          cleanup();
+          resetEngineWorker();
+          reject(new Error("engine load failed"));
+        }
+
+        function onMessage(event) {
+          const line = String(event.data || "").trim();
+          if (!line) {
+            return;
           }
-          const value = pieceValue(piece.type);
-          score += piece.color === perspective ? value : -value;
+
+          if (phase === "uci" && line === "uciok") {
+            phase = "ready";
+            worker.postMessage("setoption name Hash value " + engineHashMb);
+            worker.postMessage("setoption name Skill Level value 20");
+            worker.postMessage("isready");
+            return;
+          }
+
+          if (phase === "ready" && line === "readyok") {
+            cleanup();
+            engineState.worker = worker;
+            resolve(worker);
+            return;
+          }
+        }
+
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+        worker.postMessage("uci");
+      });
+
+      return engineState.readyPromise;
+    }
+
+    async function requestEngineMove(fen) {
+      const worker = await ensureEngineWorker();
+
+      return new Promise((resolve, reject) => {
+        if (engineState.pendingSearch) {
+          engineState.pendingSearch.reject(new Error("engine busy"));
+          clearTimeout(engineState.pendingSearch.timer);
+          engineState.pendingSearch = null;
+        }
+
+        function cleanup() {
+          worker.removeEventListener("message", onMessage);
+          worker.removeEventListener("error", onError);
+          if (engineState.pendingSearch?.cleanup === cleanup) {
+            clearTimeout(engineState.pendingSearch.timer);
+            engineState.pendingSearch = null;
+          }
+        }
+
+        function fail(message) {
+          cleanup();
+          resetEngineWorker();
+          reject(new Error(message));
+        }
+
+        function onError() {
+          fail("engine crashed");
+        }
+
+        function onMessage(event) {
+          const line = String(event.data || "").trim();
+          if (!line || !line.startsWith("bestmove ")) {
+            return;
+          }
+
+          const parts = line.split(/\s+/);
+          const bestmove = parts[1];
+          if (!bestmove || bestmove === "(none)") {
+            fail("engine returned no move");
+            return;
+          }
+
+          cleanup();
+          resolve({
+            source: "stockfish-web",
+            uci: bestmove
+          });
+        }
+
+        const timer = window.setTimeout(() => {
+          fail("engine timed out");
+        }, 8000);
+
+        engineState.pendingSearch = {
+          timer,
+          cleanup,
+          reject
+        };
+
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+        worker.postMessage("ucinewgame");
+        worker.postMessage("position fen " + fen);
+        worker.postMessage("go depth " + engineSearchDepth + " movetime " + engineMoveTimeMs);
+      });
+    }
+
+    function requestHeuristicMove(game) {
+      const moves = typeof game?.moves === "function" ? game.moves({ verbose: true }) : [];
+      if (!Array.isArray(moves) || moves.length === 0) {
+        return null;
+      }
+
+      const captureValues = {
+        p: 100,
+        n: 320,
+        b: 330,
+        r: 500,
+        q: 900,
+        k: 0
+      };
+      const centerSquares = new Set(["d4", "e4", "d5", "e5", "c3", "f3", "c6", "f6"]);
+      let bestMove = null;
+      let bestScore = -Infinity;
+
+      for (const move of moves) {
+        const next = new Chess(game.fen());
+        const applied = next.move({
+          from: move.from,
+          to: move.to,
+          promotion: move.promotion || undefined
+        });
+        if (!applied) {
+          continue;
+        }
+
+        let score = 0;
+        if (move.captured) {
+          score += captureValues[move.captured] || 0;
+        }
+        if (move.promotion) {
+          score += 800;
+        }
+        if (next.isCheckmate()) {
+          score += 100000;
+        } else if (next.inCheck()) {
+          score += 140;
+        }
+        if (centerSquares.has(move.to)) {
+          score += 25;
+        }
+        if (move.flags && move.flags.includes("k")) {
+          score += 60;
+        }
+        if (move.flags && move.flags.includes("q")) {
+          score += 55;
+        }
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMove = move;
         }
       }
-      return score;
-    }
-
-    function hasImmediateCheck(game) {
-      if (typeof game.isCheck === "function") {
-        return game.isCheck();
-      }
-      if (typeof game.inCheck === "function") {
-        return game.inCheck();
-      }
-      return false;
-    }
-
-    function moveToUci(move) {
-      return move.from + move.to + (move.promotion || "");
-    }
-
-    function emergencyLocalMove(fen) {
-      const game = createGame(fen);
-      if (!game) {
-        return null;
-      }
-
-      const legalMoves = game.moves({ verbose: true });
-      if (!Array.isArray(legalMoves) || legalMoves.length === 0) {
-        return null;
-      }
-
-      const perspective = game.turn();
-      const bestMove = [...legalMoves]
-        .map((move) => {
-          let score = 0;
-          if (move.captured) {
-            score += 2000 + pieceValue(move.captured);
-          }
-          if (move.promotion) {
-            score += 5000 + pieceValue(move.promotion);
-          }
-
-          game.move(move);
-          if (typeof game.isCheckmate === "function" && game.isCheckmate()) {
-            score += 1000000;
-          }
-          if (hasImmediateCheck(game)) {
-            score += 1500;
-          }
-          score += materialBalance(game, perspective);
-          game.undo();
-
-          const fromCenter = Math.abs(move.from.charCodeAt(0) - 101) + Math.abs(Number(move.from[1]) - 4.5);
-          const toCenter = Math.abs(move.to.charCodeAt(0) - 101) + Math.abs(Number(move.to[1]) - 4.5);
-          score += Math.round((fromCenter - toCenter) * 10);
-          return { move, score };
-        })
-        .sort((left, right) => right.score - left.score || moveToUci(left.move).localeCompare(moveToUci(right.move)))[0];
 
       if (!bestMove) {
         return null;
       }
 
       return {
-        source: "browser-fallback",
-        uci: moveToUci(bestMove.move),
+        source: "legal-fallback",
+        uci: bestMove.from + bestMove.to + (bestMove.promotion || "")
       };
     }
 
-    function fetchWithTimeout(resource, options = {}, timeoutMs = 2500) {
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-      return fetch(resource, {
-        ...options,
-        signal: controller.signal,
-      }).finally(() => window.clearTimeout(timeoutId));
-    }
-
-    async function loadOpeningBook() {
-      if (!openingBookPromise) {
-        openingBookPromise = fetch("opening-book.json", { cache: "force-cache" })
-          .then((response) => {
-            if (!response.ok) {
-              throw new Error("opening book unavailable");
-            }
-            return response.json();
-          })
-          .catch(() => ({ positions: {} }));
+    function previewLegalMove(game, analysis) {
+      const uci = normalizeUciMoveForGame(game, analysis?.uci);
+      if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
+        return null;
       }
-      return openingBookPromise;
-    }
 
-    function pickHumanBookMove(fen) {
-      return loadOpeningBook().then((book) => {
-        const key = normalizeFenKey(fen);
-        const entry = book?.positions?.[key];
-        if (!entry || !Array.isArray(entry.moves) || entry.moves.length === 0) {
-          return null;
-        }
-
-        const moves = entry.moves
-          .map((move) => String(move))
-          .filter((move) => {
-            if (!move) {
-              return false;
-            }
-            try {
-              applyUciOnFen(fen, move);
-              return true;
-            } catch (error) {
-              return false;
-            }
-          });
-        if (moves.length === 0) {
-          return null;
-        }
-
-        const lastMove = humanBookLastMove[key] || "";
-        const pool =
-          moves.length > 1 && lastMove
-            ? moves.filter((move) => move !== lastMove)
-            : moves;
-        const choices = pool.length > 0 ? pool : moves;
-        const uci = choices[Math.floor(Math.random() * choices.length)];
-        humanBookLastMove[key] = uci;
-        return {
-          source: String(entry.source || "lichess-human"),
-          uci,
-        };
-      });
-    }
-
-    function applyUciOnFen(fen, uci) {
-      const game = new Chess(fen);
-      const move = game.move({
+      const preview = new Chess(game.fen());
+      const move = preview.move({
         from: uci.slice(0, 2),
         to: uci.slice(2, 4),
-        promotion: uci.length > 4 ? uci.slice(4, 5) : undefined,
+        promotion: uci[4] || undefined
       });
+
       if (!move) {
-        throw new Error("illegal move returned by provider");
-      }
-      return {
-        san: move.san,
-        fen: game.fen(),
-      };
-    }
-
-    async function cloudEvalMove(fen) {
-      const response = await fetchWithTimeout(
-        "https://lichess.org/api/cloud-eval?fen=" + encodeURIComponent(fen),
-        {
-          headers: {
-            Accept: "application/json",
-          },
-        },
-        2200
-      );
-      if (!response.ok) {
-        throw new Error("lichess cloud eval failed");
-      }
-
-      const payload = await response.json();
-      const bestLine = payload?.pvs?.[0]?.moves || "";
-      const uci = String(bestLine).trim().split(/\s+/)[0];
-      if (!uci) {
-        throw new Error("lichess cloud eval returned no move");
+        return null;
       }
 
       return {
-        source: "lichess-cloud",
+        source: String(analysis?.source || ""),
         uci,
+        san: move.san,
+        fen: preview.fen()
       };
     }
 
-    async function chessApiMove(fen) {
-      const response = await fetchWithTimeout("https://chess-api.com/v1", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          fen,
-          depth: 12,
-          variants: 1,
-        }),
-      }, 2800);
-      if (!response.ok) {
-        throw new Error("chess-api failed");
-      }
-
-      const payload = await response.json();
-      if (!payload?.move) {
-        throw new Error("chess-api returned no move");
-      }
-
-      return {
-        source: "chess-api",
-        uci: String(payload.move),
-      };
-    }
-
-    async function chessDbMove(fen) {
-      const response = await fetchWithTimeout(
-        "https://www.chessdb.cn/cdb.php?action=queryall&board=" + encodeURIComponent(fen),
-        {},
-        2200
-      );
-      if (!response.ok) {
-        throw new Error("chessdb failed");
-      }
-
-      const payload = (await response.text()).trim();
-      const first = payload.split("|", 1)[0] || "";
-      if (!first.startsWith("move:")) {
-        throw new Error("chessdb returned no move");
-      }
-
-      return {
-        source: "chessdb",
-        uci: first.split(",", 1)[0].split(":", 1)[1],
-      };
-    }
-
-    async function resolveEngineMove(fen) {
-      const cacheKey = normalizeFenKey(fen);
-      if (engineMoveCache.has(cacheKey)) {
-        return engineMoveCache.get(cacheKey);
-      }
-
-      const providers = [cloudEvalMove, chessApiMove, chessDbMove];
-      let lastError = null;
+    async function resolveAnalysis(game, fen) {
+      const providers = [
+        () => requestOpeningBookMove(fen),
+        () => requestEngineMove(fen)
+      ];
 
       for (const provider of providers) {
+        let analysis = null;
+
         try {
-          const move = await provider(fen);
-          applyUciOnFen(fen, move.uci);
-          engineMoveCache.set(cacheKey, move);
-          return move;
+          analysis = await provider();
         } catch (error) {
-          lastError = error;
+          analysis = null;
+        }
+
+        if (!analysis) {
+          continue;
+        }
+
+        const resolved = previewLegalMove(game, analysis);
+        if (resolved) {
+          return resolved;
         }
       }
 
-      const emergencyMove = emergencyLocalMove(fen);
-      if (emergencyMove) {
-        engineMoveCache.set(cacheKey, emergencyMove);
-        return emergencyMove;
+      try {
+        resetEngineWorker();
+        const engineAnalysis = await requestEngineMove(fen);
+        const resolved = previewLegalMove(game, engineAnalysis);
+        if (resolved) {
+          return resolved;
+        }
+      } catch (error) {
       }
 
-      throw lastError || new Error("No engine provider available");
-    }
-
-    async function resolveBestMove(fen) {
-      const humanMove = await pickHumanBookMove(fen);
-      if (humanMove) {
-        return humanMove;
+      const heuristicAnalysis = requestHeuristicMove(game);
+      const heuristicResolved = previewLegalMove(game, heuristicAnalysis);
+      if (heuristicResolved) {
+        return heuristicResolved;
       }
-      return resolveEngineMove(fen);
+
+      throw new Error("analysis unavailable");
     }
 
     function applyFenPosition(fen, moveUci = "") {
@@ -1852,6 +2136,13 @@
       selectedSquare = null;
       lastMoveSquares = moveUci ? [moveUci.slice(0, 2), moveUci.slice(2, 4)] : [];
       refreshUi();
+    }
+
+    function applyResolvedAnalysis(analysis) {
+      applyFenPosition(analysis.fen, analysis.uci);
+      recordAnalyzeSource(analysis.source);
+      setResult(analysis.san, "");
+      commitState();
     }
 
     function toggleTurn() {
@@ -2019,6 +2310,34 @@
       }
     }
 
+    function initialFenFromLocation() {
+      try {
+        const fen = new URLSearchParams(window.location.search).get("fen");
+        return fen ? fen.trim() : "";
+      } catch (error) {
+        return "";
+      }
+    }
+
+    function applyInitialPosition() {
+      const fen = initialFenFromLocation();
+      if (!fen) {
+        applyStartPosition(false);
+        return;
+      }
+
+      try {
+        applyFenPosition(fen);
+        selectedSquare = null;
+        lastMoveSquares = [];
+        activeMode = modeMove;
+        markPositionDirty();
+        refreshUi();
+      } catch (error) {
+        applyStartPosition(false);
+      }
+    }
+
     function clearBoard(record = true) {
       boardState = {};
       selectedSquare = null;
@@ -2106,8 +2425,9 @@
         return;
       }
 
-      const fen = buildFen();
-      const game = createGame(fen);
+      const state = buildAnalyzableGameState();
+      const fen = state.fen;
+      const game = state.game;
       updateFen();
       analyzeBtn.disabled = true;
       setResult("...", "");
@@ -2124,23 +2444,15 @@
           return;
         }
 
-        const bestMove = await resolveBestMove(fen);
-        const applied = applyUciOnFen(fen, bestMove.uci);
-        applyFenPosition(applied.fen, bestMove.uci);
-        recordAnalyzeSource(bestMove.source);
-        setResult(applied.san, "");
-        commitState();
+        const bestMove = await resolveAnalysis(game, fen);
+        applyResolvedAnalysis(bestMove);
       } catch (error) {
-        const emergencyMove = emergencyLocalMove(fen);
-        if (emergencyMove) {
-          const applied = applyUciOnFen(fen, emergencyMove.uci);
-          applyFenPosition(applied.fen, emergencyMove.uci);
-          recordAnalyzeSource(emergencyMove.source);
-          setResult(applied.san, "");
-          commitState();
-          return;
+        const message = String(error?.message || "").toLowerCase();
+        if (message.includes("fen") || message.includes("board")) {
+          setResult("fix board", "");
+        } else {
+          setResult("unavailable", "");
         }
-        setResult("fix board", "");
       } finally {
         analyzeBtn.disabled = false;
       }
@@ -2194,7 +2506,7 @@
     buildPaletteSkeleton();
     buildBoardSkeleton();
     setResult(defaultResult.move, defaultResult.note);
-    applyStartPosition(false);
+    applyInitialPosition();
     setMode(modeMove);
     historyStack = [captureState()];
     redoStack = [];
