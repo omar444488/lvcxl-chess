@@ -1195,9 +1195,9 @@
     const openingBookUrl = "./opening-book.json";
     const stockfishAsmWorkerUrl = "https://unpkg.com/stockfish.js@9.0.0/stockfish.js";
     const stockfishWasmWorkerUrl = "https://unpkg.com/stockfish.js@9.0.0/stockfish.wasm.js";
-    const engineMoveTimeMs = 3200;
-    const engineHashMb = 64;
-    const engineSearchDepth = 22;
+    const engineMoveTimeMs = 7000;
+    const engineHashMb = 128;
+    const engineSearchDepth = 26;
     const openingBookState = {
       positions: null,
       promise: null
@@ -1440,6 +1440,15 @@
       return value || "-";
     }
 
+    function castleStringFromState(castling) {
+      let value = "";
+      if (castling?.K) value += "K";
+      if (castling?.Q) value += "Q";
+      if (castling?.k) value += "k";
+      if (castling?.q) value += "q";
+      return value || "-";
+    }
+
     function currentCastlingState() {
       return {
         K: castleKEl.checked,
@@ -1465,14 +1474,14 @@
       });
     }
 
-    function buildPlacement() {
+    function buildPlacementFromState(stateBoard = boardState) {
       const rows = [];
       for (const rank of ranks) {
         let row = "";
         let emptyRun = 0;
         for (const file of files) {
           const square = file + rank;
-          const piece = boardState[square];
+          const piece = stateBoard[square];
           if (!piece) {
             emptyRun += 1;
             continue;
@@ -1489,6 +1498,10 @@
         rows.push(row);
       }
       return rows.join("/");
+    }
+
+    function buildPlacement() {
+      return buildPlacementFromState(boardState);
     }
 
     function buildFen() {
@@ -1541,7 +1554,7 @@
       return rights || "-";
     }
 
-    function sanitizeEpSquare(turn, ep) {
+    function sanitizeEpSquare(turn, ep, stateBoard = boardState) {
       const value = String(ep || "-").trim();
       if (!/^[a-h][36]$/.test(value)) {
         return "-";
@@ -1555,26 +1568,56 @@
       }
 
       if (turn === "w") {
-        if (rank !== "6" || boardState[file + "5"] !== "p") {
+        if (rank !== "6" || stateBoard[file + "5"] !== "p") {
           return "-";
         }
         const left = fileIndex > 0 ? files[fileIndex - 1] + "5" : "";
         const right = fileIndex < files.length - 1 ? files[fileIndex + 1] + "5" : "";
-        if (boardState[left] !== "P" && boardState[right] !== "P") {
+        if (stateBoard[left] !== "P" && stateBoard[right] !== "P") {
           return "-";
         }
         return value;
       }
 
-      if (rank !== "3" || boardState[file + "4"] !== "P") {
+      if (rank !== "3" || stateBoard[file + "4"] !== "P") {
         return "-";
       }
       const left = fileIndex > 0 ? files[fileIndex - 1] + "4" : "";
       const right = fileIndex < files.length - 1 ? files[fileIndex + 1] + "4" : "";
-      if (boardState[left] !== "p" && boardState[right] !== "p") {
+      if (stateBoard[left] !== "p" && stateBoard[right] !== "p") {
         return "-";
       }
       return value;
+    }
+
+    function buildFenKeyFromSnapshot(state) {
+      const snapshotBoard = state?.boardState && typeof state.boardState === "object" ? state.boardState : boardState;
+      const snapshotTurn = state?.turn === "b" ? "b" : "w";
+      const snapshotCastling = castleStringFromState(state?.castling || currentCastlingState());
+      const snapshotEp = sanitizeEpSquare(snapshotTurn, state?.ep ?? epEl.value, snapshotBoard);
+      return [buildPlacementFromState(snapshotBoard), snapshotTurn, snapshotCastling, snapshotEp].join(" ");
+    }
+
+    function buildCurrentFenKey() {
+      return buildFenKeyFromSnapshot({
+        boardState,
+        turn: turnEl.value,
+        castling: currentCastlingState(),
+        ep: epEl.value
+      });
+    }
+
+    function currentPositionRepetitionCount() {
+      const targetKey = buildCurrentFenKey();
+      let count = 0;
+
+      for (const state of historyStack) {
+        if (buildFenKeyFromSnapshot(state) === targetKey) {
+          count += 1;
+        }
+      }
+
+      return count;
     }
 
     function buildAnalyzableGameState() {
@@ -1603,15 +1646,18 @@
       };
     }
 
-    function gameOverResult(game) {
+    function gameOverResult(game, repetitionCount = 1) {
       if (!game) {
-        return null;
-      }
-      if (typeof game.isGameOver === "function" && !game.isGameOver()) {
         return null;
       }
       if (typeof game.isCheckmate === "function" && game.isCheckmate()) {
         return { move: "mate", note: "" };
+      }
+      if (repetitionCount >= 3) {
+        return { move: "draw", note: "" };
+      }
+      if (Math.max(0, Number(halfmoveEl.value || 0)) >= 100) {
+        return { move: "draw", note: "" };
       }
       if (typeof game.isStalemate === "function" && game.isStalemate()) {
         return { move: "draw", note: "" };
@@ -1619,7 +1665,10 @@
       if (typeof game.isDraw === "function" && game.isDraw()) {
         return { move: "draw", note: "" };
       }
-      return { move: "game over", note: "" };
+      if (typeof game.isGameOver === "function" && game.isGameOver()) {
+        return { move: "game over", note: "" };
+      }
+      return null;
     }
 
     function normalizeFenKey(fen) {
@@ -1782,11 +1831,12 @@
             },
             body: JSON.stringify({
               fen,
-              depth: 15,
+              depth: 20,
+              maxThinkingTime: 200,
               variants: 1
             })
           },
-          3200
+          12000
         );
         if (!response.ok) {
           return null;
@@ -1797,6 +1847,32 @@
         }
         return {
           source: "chess-api",
+          uci
+        };
+      } catch (error) {
+        return null;
+      }
+    }
+
+    async function requestChessDbMove(fen) {
+      try {
+        const { response, payload } = await fetchJsonWithTimeout(
+          "https://www.chessdb.cn/cdb.php?action=querybest&json=1&board=" + encodeURIComponent(fen),
+          {
+            headers: { Accept: "application/json" },
+            cache: "no-store"
+          },
+          2500
+        );
+        if (!response.ok || String(payload?.status || "").toLowerCase() !== "ok") {
+          return null;
+        }
+        const uci = String(payload?.move || "").trim();
+        if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
+          return null;
+        }
+        return {
+          source: "chessdb",
           uci
         };
       } catch (error) {
@@ -2051,8 +2127,9 @@
       const providers = [
         () => requestOpeningBookMove(fen),
         () => requestCloudEvalMove(fen),
-        () => requestEngineMove(fen),
-        () => requestChessApiMove(fen)
+        () => requestChessApiMove(fen),
+        () => requestChessDbMove(fen),
+        () => requestEngineMove(fen)
       ];
 
       for (const provider of providers) {
@@ -2434,7 +2511,7 @@
           return;
         }
 
-        const terminalState = gameOverResult(game);
+        const terminalState = gameOverResult(game, currentPositionRepetitionCount());
         if (terminalState) {
           setResult(terminalState.move, terminalState.note);
           return;
