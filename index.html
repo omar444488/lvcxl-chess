@@ -1193,11 +1193,11 @@
     const paletteButtons = {};
     const humanSources = new Set(["lichess-masters", "lichess-human", "opening-book"]);
     const openingBookUrl = "./opening-book.json";
-    const stockfishAsmWorkerUrl = "./stockfish.js";
-    const stockfishWasmWorkerUrl = "./stockfish.wasm.js";
-    const engineMoveTimeMs = 1600;
-    const engineHashMb = 32;
-    const engineSearchDepth = 18;
+    const stockfishAsmWorkerUrl = "https://unpkg.com/stockfish.js@9.0.0/stockfish.js";
+    const stockfishWasmWorkerUrl = "https://unpkg.com/stockfish.js@9.0.0/stockfish.wasm.js";
+    const engineMoveTimeMs = 3200;
+    const engineHashMb = 64;
+    const engineSearchDepth = 22;
     const openingBookState = {
       positions: null,
       promise: null
@@ -2050,7 +2050,9 @@
     async function resolveAnalysis(game, fen) {
       const providers = [
         () => requestOpeningBookMove(fen),
-        () => requestEngineMove(fen)
+        () => requestCloudEvalMove(fen),
+        () => requestEngineMove(fen),
+        () => requestChessApiMove(fen)
       ];
 
       for (const provider of providers) {
@@ -2080,12 +2082,6 @@
           return resolved;
         }
       } catch (error) {
-      }
-
-      const heuristicAnalysis = requestHeuristicMove(game);
-      const heuristicResolved = previewLegalMove(game, heuristicAnalysis);
-      if (heuristicResolved) {
-        return heuristicResolved;
       }
 
       throw new Error("analysis unavailable");
