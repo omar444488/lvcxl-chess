@@ -1274,6 +1274,7 @@
         }
         selectedSquare = null;
         lastMoveSquares = [];
+        syncPositionMetaFromBoard();
         markPositionDirty();
         refreshUi();
         commitState();
@@ -1316,6 +1317,7 @@
         selectedSquare = null;
       }
       lastMoveSquares = [];
+      syncPositionMetaFromBoard();
       markPositionDirty();
       refreshUi();
       commitState();
@@ -2361,8 +2363,14 @@
         return null;
       }
 
-      candidates.sort((left, right) => right.selectionScore - left.selectionScore);
-      return candidates[0];
+      const decisiveCandidates = candidates.filter((candidate) => {
+        const nextKey = normalizeFenKey(candidate.fen);
+        return !candidate.isDraw && countFenKeyInHistory(nextKey) < 2;
+      });
+      const pool = decisiveCandidates.length > 0 ? decisiveCandidates : candidates;
+
+      pool.sort((left, right) => right.selectionScore - left.selectionScore);
+      return pool[0];
     }
 
     async function resolveAnalysis(game, fen) {
@@ -2690,14 +2698,33 @@
       commitState();
     }
 
-    function movePiece(fromSquare, toSquare) {
-      const movingPiece = boardState[fromSquare];
-      if (!movingPiece || fromSquare === toSquare) {
-        return;
+    function syncPositionMetaFromBoard() {
+      setCastlingFromString(deriveCastleStringFromBoard());
+      epEl.value = "-";
+    }
+
+    function manualMoveCandidate(fromSquare, toSquare, movingPiece) {
+      const move = {
+        from: fromSquare,
+        to: toSquare
+      };
+
+      const pieceType = String(movingPiece || "").toLowerCase();
+      if (pieceType === "p") {
+        const targetRank = toSquare[1];
+        if (targetRank === "1" || targetRank === "8") {
+          move.promotion = "q";
+        }
       }
 
+      return move;
+    }
+
+    function applySimpleBoardMove(fromSquare, toSquare, movingPiece) {
       boardState[toSquare] = movingPiece;
       delete boardState[fromSquare];
+      syncPositionMetaFromBoard();
+      halfmoveEl.value = "0";
       selectedSquare = null;
       lastMoveSquares = [fromSquare, toSquare];
 
@@ -2708,6 +2735,33 @@
       markPositionDirty();
       refreshUi();
       commitState();
+    }
+
+    function movePiece(fromSquare, toSquare) {
+      const movingPiece = boardState[fromSquare];
+      if (!movingPiece || fromSquare === toSquare) {
+        return;
+      }
+
+      const state = buildAnalyzableGameState();
+      const game = state.game;
+
+      if (game) {
+        const appliedMove = game.move(manualMoveCandidate(fromSquare, toSquare, movingPiece));
+        if (appliedMove) {
+          applyFenPosition(game.fen(), appliedMove.from + appliedMove.to + (appliedMove.promotion || ""));
+          markPositionDirty();
+          commitState();
+          return;
+        }
+
+        lastMoveSquares = [];
+        selectedSquare = fromSquare;
+        refreshUi();
+        return;
+      }
+
+      applySimpleBoardMove(fromSquare, toSquare, movingPiece);
     }
 
     function renderPalette() {
