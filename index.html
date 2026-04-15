@@ -1203,6 +1203,33 @@
       promise: null
     };
     const openingBookHistory = new Map();
+    const trackedOpeningFamilies = [
+      {
+        name: "Sicilian Defense",
+        rootMove: "e2e4",
+        replyMove: "c7c5"
+      },
+      {
+        name: "Ruy Lopez",
+        rootMove: "e2e4",
+        replyMove: "e7e5"
+      },
+      {
+        name: "King's Indian Defense",
+        rootMove: "d2d4",
+        replyMove: "g8f6"
+      },
+      {
+        name: "Queen's Gambit Declined",
+        rootMove: "d2d4",
+        replyMove: "d7d5"
+      }
+    ];
+    const startFenKey = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -";
+    const afterE4FenKey = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -";
+    const afterD4FenKey = "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -";
+    let currentOpeningFamily = null;
+    let lastOpeningFamilyName = "";
     const engineState = {
       worker: null,
       readyPromise: null,
@@ -1685,6 +1712,58 @@
       return list[Math.floor(Math.random() * list.length)];
     }
 
+    function resetOpeningFamilyPlan() {
+      currentOpeningFamily = null;
+    }
+
+    function openingFamilyPoolForFenKey(fenKey) {
+      if (fenKey === startFenKey) {
+        return trackedOpeningFamilies;
+      }
+      if (fenKey === afterE4FenKey) {
+        return trackedOpeningFamilies.filter((family) => family.rootMove === "e2e4");
+      }
+      if (fenKey === afterD4FenKey) {
+        return trackedOpeningFamilies.filter((family) => family.rootMove === "d2d4");
+      }
+      return [];
+    }
+
+    function openingPlanMovesForFenKey(family, fenKey) {
+      if (!family) {
+        return [];
+      }
+      if (fenKey === startFenKey) {
+        return [family.rootMove];
+      }
+      if (fenKey === afterE4FenKey && family.rootMove === "e2e4") {
+        return [family.replyMove];
+      }
+      if (fenKey === afterD4FenKey && family.rootMove === "d2d4") {
+        return [family.replyMove];
+      }
+      return [];
+    }
+
+    function ensureOpeningFamilyPlan(fenKey) {
+      const pool = openingFamilyPoolForFenKey(fenKey);
+      if (pool.length === 0) {
+        return currentOpeningFamily;
+      }
+
+      const currentMoves = openingPlanMovesForFenKey(currentOpeningFamily, fenKey);
+      if (currentMoves.length > 0) {
+        return currentOpeningFamily;
+      }
+
+      const filteredPool = pool.filter((family) => family.name !== lastOpeningFamilyName);
+      currentOpeningFamily = randomChoice(filteredPool.length > 0 ? filteredPool : pool) || null;
+      if (currentOpeningFamily) {
+        lastOpeningFamilyName = currentOpeningFamily.name;
+      }
+      return currentOpeningFamily;
+    }
+
     function normalizeUciMoveForGame(game, uci) {
       const value = String(uci || "").trim().toLowerCase();
       if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(value)) {
@@ -1773,7 +1852,8 @@
         return null;
       }
 
-      const position = positions[normalizeFenKey(fen)];
+      const fenKey = normalizeFenKey(fen);
+      const position = positions[fenKey];
       const moves = Array.isArray(position?.moves)
         ? position.moves.filter((move) => typeof move === "string" && /^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(move))
         : [];
@@ -1782,10 +1862,14 @@
         return null;
       }
 
-      const lastMove = openingBookHistory.get(normalizeFenKey(fen));
-      const candidates = moves.length > 1 ? moves.filter((move) => move !== lastMove) : moves;
-      const uci = randomChoice(candidates.length > 0 ? candidates : moves);
-      openingBookHistory.set(normalizeFenKey(fen), uci);
+      const plannedFamily = ensureOpeningFamilyPlan(fenKey);
+      const plannedMoves = openingPlanMovesForFenKey(plannedFamily, fenKey);
+      const preferredMoves = plannedMoves.filter((move) => moves.includes(move));
+      const movePool = preferredMoves.length > 0 ? preferredMoves : moves;
+      const lastMove = openingBookHistory.get(fenKey);
+      const candidates = movePool.length > 1 ? movePool.filter((move) => move !== lastMove) : movePool;
+      const uci = randomChoice(candidates.length > 0 ? candidates : movePool);
+      openingBookHistory.set(fenKey, uci);
 
       return {
         source: String(position?.source || "opening-book"),
@@ -2629,6 +2713,7 @@
 
     function applyStartPosition(record = true) {
       boardState = { ...startPosition };
+      resetOpeningFamilyPlan();
       selectedSquare = null;
       lastMoveSquares = [];
       activeMode = modeMove;
@@ -2662,6 +2747,7 @@
       }
 
       try {
+        resetOpeningFamilyPlan();
         applyFenPosition(fen);
         selectedSquare = null;
         lastMoveSquares = [];
@@ -2675,6 +2761,7 @@
 
     function clearBoard(record = true) {
       boardState = {};
+      resetOpeningFamilyPlan();
       selectedSquare = null;
       lastMoveSquares = [];
       resetSourceStats();
@@ -2691,6 +2778,7 @@
     }
 
     function handlePositionMetaChange() {
+      resetOpeningFamilyPlan();
       selectedSquare = null;
       lastMoveSquares = [];
       markPositionDirty();
@@ -2701,6 +2789,7 @@
     function syncPositionMetaFromBoard() {
       setCastlingFromString(deriveCastleStringFromBoard());
       epEl.value = "-";
+      resetOpeningFamilyPlan();
     }
 
     function manualMoveCandidate(fromSquare, toSquare, movingPiece) {
