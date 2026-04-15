@@ -1799,7 +1799,7 @@
             headers: { Accept: "application/json" },
             cache: "no-store"
           },
-          2200
+          3000
         );
         if (!response.ok) {
           return null;
@@ -1836,7 +1836,7 @@
               variants: 1
             })
           },
-          12000
+          10000
         );
         if (!response.ok) {
           return null;
@@ -1862,7 +1862,7 @@
             headers: { Accept: "application/json" },
             cache: "no-store"
           },
-          2500
+          4000
         );
         if (!response.ok || String(payload?.status || "").toLowerCase() !== "ok") {
           return null;
@@ -1920,7 +1920,7 @@
           cleanup();
           resetEngineWorker();
           reject(new Error("engine startup timeout"));
-        }, 15000);
+        }, 20000);
 
         function cleanup() {
           window.clearTimeout(startupTimer);
@@ -2015,7 +2015,7 @@
 
         const timer = window.setTimeout(() => {
           fail("engine timed out");
-        }, 8000);
+        }, 15000);
 
         engineState.pendingSearch = {
           timer,
@@ -2025,10 +2025,25 @@
 
         worker.addEventListener("message", onMessage);
         worker.addEventListener("error", onError);
-        worker.postMessage("ucinewgame");
         worker.postMessage("position fen " + fen);
         worker.postMessage("go depth " + engineSearchDepth + " movetime " + engineMoveTimeMs);
       });
+    }
+
+    async function requestRemoteMove(fen) {
+      const results = await Promise.allSettled([
+        requestCloudEvalMove(fen),
+        requestChessApiMove(fen),
+        requestChessDbMove(fen)
+      ]);
+
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value) {
+          return result.value;
+        }
+      }
+
+      return null;
     }
 
     function requestHeuristicMove(game) {
@@ -2126,9 +2141,7 @@
     async function resolveAnalysis(game, fen) {
       const providers = [
         () => requestOpeningBookMove(fen),
-        () => requestCloudEvalMove(fen),
-        () => requestChessApiMove(fen),
-        () => requestChessDbMove(fen),
+        () => requestRemoteMove(fen),
         () => requestEngineMove(fen)
       ];
 
