@@ -1791,10 +1791,15 @@
       };
     }
 
+    function numericScore(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
     async function requestCloudEvalMove(fen) {
       try {
         const { response, payload } = await fetchJsonWithTimeout(
-          "https://lichess.org/api/cloud-eval?fen=" + encodeURIComponent(fen),
+          "https://lichess.org/api/cloud-eval?fen=" + encodeURIComponent(fen) + "&multiPv=4",
           {
             headers: { Accept: "application/json" },
             cache: "no-store"
@@ -1805,14 +1810,27 @@
           return null;
         }
         const pvs = Array.isArray(payload?.pvs) ? payload.pvs : [];
-        const moves = typeof pvs[0]?.moves === "string" ? pvs[0].moves.trim().split(/\s+/) : [];
-        const uci = moves[0];
-        if (!uci || !/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
+        const candidates = [];
+
+        for (const pv of pvs) {
+          const moves = typeof pv?.moves === "string" ? pv.moves.trim().split(/\s+/) : [];
+          const uci = moves[0];
+          if (!uci || !/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
+            continue;
+          }
+          candidates.push({
+            uci,
+            scoreCp: numericScore(pv?.cp),
+            mate: numericScore(pv?.mate)
+          });
+        }
+
+        if (candidates.length === 0) {
           return null;
         }
         return {
           source: "lichess-cloud-eval",
-          uci
+          candidates
         };
       } catch (error) {
         return null;
@@ -1847,7 +1865,13 @@
         }
         return {
           source: "chess-api",
-          uci
+          candidates: [
+            {
+              uci,
+              scoreCp: numericScore(payload?.centipawns ?? payload?.cp),
+              mate: numericScore(payload?.mate)
+            }
+          ]
         };
       } catch (error) {
         return null;
@@ -1873,7 +1897,12 @@
         }
         return {
           source: "chessdb",
-          uci
+          candidates: [
+            {
+              uci,
+              scoreCp: numericScore(payload?.score)
+            }
+          ]
         };
       } catch (error) {
         return null;
@@ -1943,6 +1972,7 @@
           if (phase === "uci" && line === "uciok") {
             phase = "ready";
             worker.postMessage("setoption name Hash value " + engineHashMb);
+            worker.postMessage("setoption name MultiPV value 4");
             worker.postMessage("setoption name Skill Level value 20");
             worker.postMessage("isready");
             return;
@@ -1968,6 +1998,8 @@
       const worker = await ensureEngineWorker();
 
       return new Promise((resolve, reject) => {
+        const candidateMap = new Map();
+
         if (engineState.pendingSearch) {
           engineState.pendingSearch.reject(new Error("engine busy"));
           clearTimeout(engineState.pendingSearch.timer);
@@ -1995,7 +2027,29 @@
 
         function onMessage(event) {
           const line = String(event.data || "").trim();
-          if (!line || !line.startsWith("bestmove ")) {
+          if (!line) {
+            return;
+          }
+
+          if (line.startsWith("info ")) {
+            const pvMatch = line.match(/\bpv\s+([a-h][1-8][a-h][1-8][nbrq]?)/i);
+            if (!pvMatch) {
+              return;
+            }
+
+            const multipvMatch = line.match(/\bmultipv\s+(\d+)/i);
+            const cpMatch = line.match(/\bscore\s+cp\s+(-?\d+)/i);
+            const mateMatch = line.match(/\bscore\s+mate\s+(-?\d+)/i);
+            const index = multipvMatch ? Math.max(1, Number(multipvMatch[1])) : 1;
+            candidateMap.set(index, {
+              uci: pvMatch[1].toLowerCase(),
+              scoreCp: cpMatch ? Number(cpMatch[1]) : null,
+              mate: mateMatch ? Number(mateMatch[1]) : null
+            });
+            return;
+          }
+
+          if (!line.startsWith("bestmove ")) {
             return;
           }
 
@@ -2007,9 +2061,16 @@
           }
 
           cleanup();
+          const candidates = [...candidateMap.entries()]
+            .sort((left, right) => left[0] - right[0])
+            .map((entry) => entry[1]);
+          if (!candidates.some((candidate) => candidate.uci === bestmove)) {
+            candidates.unshift({ uci: bestmove.toLowerCase(), scoreCp: null, mate: null });
+          }
           resolve({
             source: "stockfish-web",
-            uci: bestmove
+            uci: bestmove,
+            candidates
           });
         }
 
@@ -2037,13 +2098,14 @@
         requestChessDbMove(fen)
       ]);
 
+      const moves = [];
       for (const result of results) {
         if (result.status === "fulfilled" && result.value) {
-          return result.value;
+          moves.push(result.value);
         }
       }
 
-      return null;
+      return moves;
     }
 
     function requestHeuristicMove(game) {
@@ -2113,6 +2175,31 @@
       };
     }
 
+    function materialBalanceCp(game) {
+      const values = {
+        p: 100,
+        n: 320,
+        b: 330,
+        r: 500,
+        q: 900,
+        k: 0
+      };
+      let score = 0;
+
+      for (const rank of ranks) {
+        for (const file of files) {
+          const piece = game.get(file + rank);
+          if (!piece) {
+            continue;
+          }
+          const value = values[piece.type] || 0;
+          score += piece.color === "w" ? value : -value;
+        }
+      }
+
+      return score;
+    }
+
     function previewLegalMove(game, analysis) {
       const uci = normalizeUciMoveForGame(game, analysis?.uci);
       if (!/^[a-h][1-8][a-h][1-8][nbrq]?$/i.test(uci)) {
@@ -2134,40 +2221,194 @@
         source: String(analysis?.source || ""),
         uci,
         san: move.san,
-        fen: preview.fen()
+        fen: preview.fen(),
+        scoreCp: numericScore(analysis?.scoreCp),
+        mate: numericScore(analysis?.mate),
+        isCapture: Boolean(move.captured),
+        isPromotion: Boolean(move.promotion),
+        isCheck: preview.inCheck(),
+        isCheckmate: preview.isCheckmate(),
+        isDraw: preview.isDraw(),
+        materialCp: materialBalanceCp(preview)
       };
     }
 
-    async function resolveAnalysis(game, fen) {
-      const providers = [
-        () => requestOpeningBookMove(fen),
-        () => requestRemoteMove(fen),
-        () => requestEngineMove(fen)
-      ];
-
-      for (const provider of providers) {
-        let analysis = null;
-
-        try {
-          analysis = await provider();
-        } catch (error) {
-          analysis = null;
+    function countFenKeyInHistory(targetKey) {
+      let count = 0;
+      for (const state of historyStack) {
+        if (buildFenKeyFromSnapshot(state) === targetKey) {
+          count += 1;
         }
+      }
+      return count;
+    }
 
+    function recentHistoryKeys(limit = 8) {
+      return historyStack
+        .slice(Math.max(0, historyStack.length - limit))
+        .map((state) => buildFenKeyFromSnapshot(state));
+    }
+
+    function orientedScore(game, value) {
+      const number = numericScore(value);
+      if (number === null) {
+        return null;
+      }
+      return typeof game.turn === "function" && game.turn() === "b" ? -number : number;
+    }
+
+    function sourcePriority(source) {
+      switch (String(source || "")) {
+        case "opening-book":
+        case "lichess-masters":
+          return 9000;
+        case "lichess-human":
+          return 8500;
+        case "lichess-cloud-eval":
+          return 6200;
+        case "stockfish-web":
+          return 6000;
+        case "chess-api":
+          return 5600;
+        case "chessdb":
+          return 5200;
+        default:
+          return 0;
+      }
+    }
+
+    function resolvedMoveSelectionScore(game, resolved) {
+      let score = sourcePriority(resolved.source);
+      const orientedCp = orientedScore(game, resolved.scoreCp);
+      const orientedMate = orientedScore(game, resolved.mate);
+      const nextKey = normalizeFenKey(resolved.fen);
+      const priorOccurrences = countFenKeyInHistory(nextKey);
+      const recentKeys = recentHistoryKeys(8);
+
+      if (resolved.isCheckmate) {
+        score += 1_000_000;
+      }
+
+      if (typeof orientedMate === "number") {
+        if (orientedMate > 0) {
+          score += 600_000 - Math.min(Math.abs(orientedMate), 50) * 5_000;
+        } else if (orientedMate < 0) {
+          score -= 600_000 - Math.min(Math.abs(orientedMate), 50) * 5_000;
+        }
+      }
+
+      if (typeof orientedCp === "number") {
+        score += Math.max(-1600, Math.min(1600, orientedCp));
+      }
+
+      if (resolved.isCapture) {
+        score += 40;
+      }
+      if (resolved.isCheck) {
+        score += 28;
+      }
+      if (resolved.isPromotion) {
+        score += 80;
+      }
+      if (resolved.isDraw) {
+        score -= 220_000;
+      }
+      if (priorOccurrences >= 2) {
+        score -= 250_000;
+      } else if (priorOccurrences === 1) {
+        score -= 3_500;
+      }
+      if (recentKeys.length >= 2 && recentKeys[recentKeys.length - 2] === nextKey) {
+        score -= 18_000;
+      }
+      if (recentKeys.length >= 4 && recentKeys[recentKeys.length - 4] === nextKey) {
+        score -= 14_000;
+      }
+      if (recentKeys.length >= 6 && recentKeys[recentKeys.length - 6] === nextKey) {
+        score -= 10_000;
+      }
+
+      return score;
+    }
+
+    function pickBestResolvedMove(game, analyses) {
+      const candidates = [];
+
+      for (const analysis of analyses) {
         if (!analysis) {
           continue;
         }
 
-        const resolved = previewLegalMove(game, analysis);
-        if (resolved) {
-          return resolved;
+        const source = String(analysis?.source || "");
+        const sourceCandidates = Array.isArray(analysis?.candidates) && analysis.candidates.length > 0
+          ? analysis.candidates
+          : [analysis];
+
+        for (const candidate of sourceCandidates) {
+          const resolved = previewLegalMove(game, {
+            source,
+            ...candidate
+          });
+          if (!resolved) {
+            continue;
+          }
+          resolved.selectionScore = resolvedMoveSelectionScore(game, resolved);
+          candidates.push(resolved);
         }
+      }
+
+      if (candidates.length === 0) {
+        return null;
+      }
+
+      candidates.sort((left, right) => right.selectionScore - left.selectionScore);
+      return candidates[0];
+    }
+
+    async function resolveAnalysis(game, fen) {
+      try {
+        const openingAnalysis = await requestOpeningBookMove(fen);
+        const openingResolved = pickBestResolvedMove(game, [openingAnalysis]);
+        if (openingResolved) {
+          return openingResolved;
+        }
+      } catch (error) {
+      }
+
+      let fallbackResolved = null;
+
+      try {
+        const [remoteResult, engineResult] = await Promise.allSettled([
+          requestRemoteMove(fen),
+          requestEngineMove(fen)
+        ]);
+        const analyses = [];
+
+        if (remoteResult.status === "fulfilled" && Array.isArray(remoteResult.value)) {
+          analyses.push(...remoteResult.value);
+        }
+        if (engineResult.status === "fulfilled" && engineResult.value) {
+          analyses.push(engineResult.value);
+        }
+
+        const resolved = pickBestResolvedMove(game, analyses);
+        if (resolved) {
+          if (resolved.selectionScore > -120_000) {
+            return resolved;
+          }
+          fallbackResolved = resolved;
+        }
+      } catch (error) {
+      }
+
+      if (fallbackResolved) {
+        return fallbackResolved;
       }
 
       try {
         resetEngineWorker();
         const engineAnalysis = await requestEngineMove(fen);
-        const resolved = previewLegalMove(game, engineAnalysis);
+        const resolved = pickBestResolvedMove(game, [engineAnalysis]);
         if (resolved) {
           return resolved;
         }
